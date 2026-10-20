@@ -1,137 +1,115 @@
-# ShadowGauge
+# Shadow Eval Drift Monitor
 
-[![CI](https://github.com/MadanMohan0537/shadowgauge/actions/workflows/ci.yml/badge.svg)](https://github.com/MadanMohan0537/shadowgauge/actions/workflows/ci.yml)
+[![CI](https://github.com/MadanMohan0537/shadow-eval-drift-monitor/actions/workflows/ci.yml/badge.svg)](https://github.com/MadanMohan0537/shadow-eval-drift-monitor/actions/workflows/ci.yml)
 
-ShadowGauge quietly samples live AI interactions, grades copies off the request path, and raises a drift incident only after two bad windows. Its bias inspector records every sample's inclusion probability, then reports raw and inverse-probability-weighted failure rates side by side—so aggressively sampling a new intent does not get mistaken for population quality.
+**Sample copies of AI interactions, grade them off the request path, and record a drift alert only after two bad windows in a row. Each selected event keeps its inclusion probability, so a higher sampling rate for new intents can be weighted back toward the population.**
 
-> **Project Lab traceability:** project 03, originally “Hidden-Eval Canary.” ShadowGauge is the product name; this note prevents the renamed idea from being built twice.
+A Python MVP with no third-party runtime dependencies. The package and CLI are still called `shadowgauge` (version 0.1.0).
 
-## Why this exists
+## Problem and who it's for
 
-Online AI quality can regress while uptime remains green. A naive monitor can make the situation worse: it oversamples unfamiliar traffic, averages the sample, and reports a biased population rate. ShadowGauge makes the sampling contract observable and checks both quality drift and estimator health.
+An AI feature's quality can drop while uptime dashboards stay green. A monitor that gives intents outside a known set a higher sampling rate, then averages that sample, reports a biased failure rate for the whole population. This is for teams operating LLM features, and for the AI PMs and operations leads who need an early-warning signal that keeps those sampling weights visible.
 
-## What works today
+## Approach
 
-- Stable hash-based sampling at a fixed rate, with explicit oversampling for new intents.
-- A daily sample cap and a stored inclusion probability/reason for every selected event.
-- A durable SQLite queue that keeps grading away from the serving path.
-- Auditable groundedness, unanswered-question, and harmful-phrase graders.
-- Population Stability Index (PSI) drift checks with a two-window confirmation gate and cooldown.
-- **Sampling-bias inspector (P1 extension):** raw rate, Hájek inverse-probability estimate, capped weights, and effective sample size.
-- Deterministic synthetic replay that injects a regression and produces a machine-readable report.
-- Unit/integration tests and a Python 3.11–3.13 GitHub Actions matrix.
-
-The grader-version bridge, outbound Slack/email delivery, semantic model graders, and a browser dashboard are backlog items—not completed features.
-
-## Quick start
-
-No account, API key, model download, or paid service is required.
-
-```bash
-python -m venv .venv
-source .venv/bin/activate
-python -m pip install -e .
-shadowgauge simulate --db demo.db --output report.json
-cat report.json
-```
-
-To grade a batch previously placed in the SQLite queue:
-
-```bash
-shadowgauge worker --db demo.db --limit 100
-```
-
-Run the test suite:
-
-```bash
-python -m unittest discover -s tests -v
-```
-
-## Core flow
+1. **Stable sampling.** SHA-256 of the event id drives a Bernoulli draw against a fixed probability. Intents outside the known set use a higher probability. An in-memory daily cap can stop further selection. Each selected event stores its inclusion probability and reason (`fixed_rate` or `new_intent`).
+2. A durable **SQLite queue** keeps grading off the serving path. `shadowgauge worker` grades pending rows in a separate step.
+3. Transparent offline **graders**: groundedness (share of response words longer than three characters that also appear in the provided context), unanswered replies (the phrases "i don't know", "not enough information", and "cannot determine", or a response shorter than 12 characters), and the harmful phrases "steal password", "bypass authentication", and "make malware". A grade counts as a failure when groundedness is below 0.55, or when the reply is unanswered or harmful.
+4. **Drift gate.** Population Stability Index (PSI) over five fixed bins on [0, 1]. The demo scores groundedness. The gate writes an alert only after two consecutive windows at or above its threshold (default 0.2), then cools down.
+5. **Bias inspector.** Raw failure rate beside a Hájek inverse-probability-weighted estimate. Weights are capped at 20. The estimator also returns effective sample size and the number of clipped weights.
 
 ```mermaid
 flowchart TD
-    A["AI request"] --> B{"Stable sampler"}
-    B -->|not selected| C["Return normally"]
+    A["Host response copy"] --> B{"Stable sampler"}
+    B -->|not selected| C["Not queued"]
     B -->|selected + probability| D["SQLite queue"]
-    D --> E["Background graders"]
+    D --> E["Background worker"]
     E --> F["PSI + two-window gate"]
-    F --> G["Incident record"]
+    F --> G["Alert row"]
     E --> H["Bias inspector"]
 ```
 
-`AdaptiveSampler` uses SHA-256 of the event ID, so the same replay gives the same selection. New intents can receive a higher probability. `Store` persists the probability alongside the copied request, and `run_batch` grades pending records. `estimate_failure_rate` uses inverse-probability weights, capped to limit variance, and exposes effective sample size (ESS). `DriftGate` requires consecutive breaches and adds a cooldown to reduce alert storms.
+A host answers the user first, then may pass a copy to `AdaptiveSampler` and `Store`.
 
-## Reproducible evidence
+## What exists today
 
-The checked-in generator creates synthetic customer-support traffic with four intents. It introduces a shipping/returns regression after 65% of the replay. The integration test asserts that the queue drains, the report is saved, and the conservative alert fires.
+- The installable package and the `shadowgauge` console script are defined in `pyproject.toml`. Runtime dependencies are empty.
+- CLI commands: `shadowgauge simulate` (default `--count 800`, database `shadowgauge.db`, output `report.json`) and `shadowgauge worker` (default `--limit 100`).
+- Host hooks include `AdaptiveSampler`, `Store`, `run_batch`, `DriftGate`, `psi`, and `estimate_failure_rate`.
+- A synthetic customer-support replay with four intents: `billing`, `shipping`, `returns`, and `account`. Failed replies are the string `I don't know.` A shipping/returns regression starts at 65% of the event index (`int(count * 0.65)`). In `simulate`, the known intents are `billing` and `account` (probability 0.12). `shipping` and `returns` use the new-intent probability 0.35, and those are also the intents that regress.
+- 13 `unittest` cases under `tests/`. One of them checks a fixed skewed sample: raw rate 0.5, weighted rate 100/110. `.github/workflows/ci.yml` runs `python -m unittest discover -s tests -v` on Python 3.11, 3.12, and 3.13.
+- Architecture and the planned backlog: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) and [docs/BACKLOG.md](docs/BACKLOG.md).
 
-The bias estimator is tested against a deliberately skewed sample: the raw rate is 50%, while weighting recovers the known population mix (about 90.9%). This small fixture tests the estimator's behavior; it is not a claim about real model quality.
+`shadowgauge simulate` with no extra flags currently prints:
 
-## Configuration and integration
+| Field | Value |
+|---|---|
+| `sampled` / `graded` | 186 / 186 |
+| grader `failures` | 56 |
+| `population_failure_rate` | 0.1988 |
+| `raw_sample_failure_rate` | 0.3011 |
+| `weighted_failure_rate` | 0.218 |
+| `effective_sample_size` | 142.3 |
+| `psi_windows` | 0.6727, then 3.2825 |
+| `alert_fired` | true (one alert, on the second window) |
 
-This MVP exposes Python seams instead of a production proxy:
+Those three rates are computed from the synthetic failure label. On this replay the grader flags the same 56 sampled rows, because a synthetic failure is the refusal string above. `0.218` is closer to `0.1988` than `0.3011` is. PSI takes the first half of graded rows, in timestamp order, as the baseline and compares the second half as two windows. The regression starts at 65% of generated events, which is a different cut from that midpoint. The integration test asserts a drained queue, a saved report, and `alert_fired`. `report.json` is gitignored, so the table is current default-command output.
 
-```python
-from shadowgauge.sampling import AdaptiveSampler
-from shadowgauge.store import Store
+`shadowgauge worker` grades rows still marked pending. `simulate` already drains the queue, so the quick-start worker command then prints `{"processed": 0}`.
 
-sampler = AdaptiveSampler(
-    base_rate=0.05,
-    new_intent_rate=0.35,
-    known_intents={"billing", "shipping"},
-    daily_cap=500,
-)
-decision = sampler.decide(event["event_id"], event["intent"], event["ts"][:10])
-if decision.included:
-    Store("shadowgauge.db").enqueue(event, decision.probability, decision.reason)
-```
+## How success would be measured
 
-Call this after producing the user-visible response. Never place raw secrets or regulated data in `question`, `context`, or `response`; the current MVP has no redaction layer.
+| Measure | Status |
+|---|---|
+| Windows from a regression to an alert on real traffic | Not yet measured |
+| Gap between the weighted estimate and the true population rate | Not yet measured |
+| False alerts per week on real traffic | Not yet measured |
+| Share of real regressions caught before user reports | Not yet measured |
 
-## Metrics to watch
-
-| Metric | What it answers | Current output |
-|---|---|---|
-| Time to detection | How many evaluation windows pass after a regression? | Two by design |
-| Intent coverage | Which traffic groups are represented? | Stored per event; aggregate UI is planned |
-| Grader share | How much traffic is graded? | Sampled/total can be derived by the host |
-| Raw vs weighted rate | Is adaptive sampling biasing the headline? | `report.json` |
-| Effective sample size | Are a few large weights dominating? | `report.json` |
-| PSI | Did the score distribution move? | Per evaluated window |
+The two-window rule is a gate setting (`consecutive_required` defaults to 2). No committed measurement covers the rows above. The synthetic table in the previous section is default-command output.
 
 ## Limitations
 
-- Lexical overlap is explainable and offline, but it misses paraphrases and can reward copied context. It is a smoke detector, not a factuality oracle.
-- PSI uses fixed score bins and is unstable on tiny windows. Real deployments should set minimum segment counts and calibrate thresholds on historical replays.
-- Weight clipping trades lower variance for some estimator bias. ShadowGauge reports clipped count and ESS so operators can see that tradeoff.
-- The process-local daily cap is not coordinated across replicas. A production sampler needs an atomic shared budget.
-- SQLite is appropriate for a portfolio-scale single-node MVP, not high-throughput multi-writer serving.
-- Synthetic labels prove mechanics, not external validity. Human adjudication remains necessary before consequential decisions.
-- There is no authentication, PII scrubbing, retention policy, semantic grader, hosted dashboard, or outbound alert integration yet.
+- Lexical-overlap groundedness misses paraphrases and can reward copied context. Use it as a smoke detector, and review anything consequential another way.
+- PSI uses five fixed bins on [0, 1] and is unstable on tiny windows. Thresholds need calibration on historical replays.
+- Weight clipping (cap 20) lowers variance and adds some bias. `estimate_failure_rate` returns the clipped count and the effective sample size. The `simulate` report includes effective sample size and omits the clipped count.
+- The daily cap lives on one in-memory sampler. It is not shared across processes or replicas, and it resets when that object is discarded. The default replay uses a cap equal to the event count, on a single UTC day, so the cap does not bind there.
+- SQLite is single-node. Duplicate `event_id`s are ignored (`INSERT OR IGNORE`).
+- There is no PII redaction, retention policy, authentication, semantic grader, dashboard, or outbound alerting yet. The queue stores `question`, `context`, and `response` as given. Shadow evaluation copies prompts, so minimize fields and get approval before using real traffic.
 
-## Responsible use
+## Quick start
 
-Shadow evaluation can copy sensitive prompts. Minimize fields before enqueueing, set a retention window, restrict database access, and obtain appropriate user/legal approval. Treat grader flags as review signals. Do not automatically penalize users, employees, or vendors from these scores.
+Requires Python 3.11+. No account, API key, model download, or paid service. The commands below were checked with Python 3.12.3.
 
-## Roadmap
+```bash
+git clone https://github.com/MadanMohan0537/shadow-eval-drift-monitor.git
+cd shadow-eval-drift-monitor
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install -e .
+python -m unittest discover -s tests -v
+shadowgauge simulate --db demo.db --output report.json
+shadowgauge worker --db demo.db --limit 100
+```
 
-The prioritized, testable backlog—including the grader-version bridge and newly brainstormed extensions—is in [docs/BACKLOG.md](docs/BACKLOG.md). Architecture and operating assumptions are in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+`python3 -m venv` matches a system Python that is only installed as `python3`. After activation, `python` is the virtualenv interpreter. `simulate` writes `report.json` and grades every queued row. The following `worker` command reports pending work only; on a fresh simulate database that count is 0.
 
-## Repository map
+## Deployment
 
-```text
-shadowgauge/
-  sampling.py     deterministic decisions + weighted estimator
-  grading.py      transparent offline graders
-  store.py        SQLite queue, grades, and incidents
-  monitoring.py   PSI and alert gate
-  simulation.py   reproducible synthetic traffic
-  cli.py          simulate and worker commands
-tests/             unit and end-to-end checks
-docs/              architecture and rigorous backlog
+Cloudflare Workers is the planned target. Workers is not configured in this repository, and this project is not deployed.
+
+A deploy needs all of the following, which are absent today:
+
+- a `wrangler.toml`
+- a Worker entry point
+- Cloudflare Python Workers, or a JavaScript/TypeScript port of this package (the current code is a local Python library using SQLite)
+
+When that configuration is in the tree, publish it with:
+
+```bash
+npx wrangler deploy
 ```
 
 ## License
 
-MIT
+MIT. See [LICENSE](LICENSE).
