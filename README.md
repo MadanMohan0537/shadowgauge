@@ -18,10 +18,11 @@ Online AI quality can regress while uptime remains green. A naive monitor can ma
 - Auditable groundedness, unanswered-question, and harmful-phrase graders.
 - Population Stability Index (PSI) drift checks with a two-window confirmation gate and cooldown.
 - **Sampling-bias inspector (P1 extension):** raw rate, Hájek inverse-probability estimate, capped weights, and effective sample size.
+- **Grader-version bridge (P2 extension):** dual-grade a frozen overlap, enforce per-intent coverage, and quarantine measurement shifts before incident creation.
 - Deterministic synthetic replay that injects a regression and produces a machine-readable report.
 - Unit/integration tests and a Python 3.11–3.13 GitHub Actions matrix.
 
-The grader-version bridge, outbound Slack/email delivery, semantic model graders, and a browser dashboard are backlog items—not completed features.
+Outbound Slack/email delivery, semantic model graders, and a browser dashboard remain backlog items—not completed features.
 
 ## Quick start
 
@@ -39,6 +40,7 @@ To grade a batch previously placed in the SQLite queue:
 
 ```bash
 shadowgauge worker --db demo.db --limit 100
+shadowgauge bridge-demo --output bridge-report.json
 ```
 
 Run the test suite:
@@ -56,17 +58,24 @@ flowchart TD
     B -->|selected + probability| D["SQLite queue"]
     D --> E["Background graders"]
     E --> F["PSI + two-window gate"]
-    F --> G["Incident record"]
+    F --> G["Grader bridge"]
+    G --> I["Incident or measurement hold"]
     E --> H["Bias inspector"]
 ```
 
-`AdaptiveSampler` uses SHA-256 of the event ID, so the same replay gives the same selection. New intents can receive a higher probability. `Store` persists the probability alongside the copied request, and `run_batch` grades pending records. `estimate_failure_rate` uses inverse-probability weights, capped to limit variance, and exposes effective sample size (ESS). `DriftGate` requires consecutive breaches and adds a cooldown to reduce alert storms.
+`AdaptiveSampler` uses SHA-256 of the event ID, so the same replay gives the same selection. New intents can receive a higher probability. `Store` persists the probability alongside the copied request, and `run_batch` grades pending records. `estimate_failure_rate` uses inverse-probability weights, capped to limit variance, and exposes effective sample size (ESS). `DriftGate` requires consecutive breaches and adds a cooldown to reduce alert storms. Before switching graders, `analyze_bridge` compares paired old/new scores and `classify_product_drift` refuses to label an incompatible measurement change as a product incident.
 
 ## Reproducible evidence
 
 The checked-in generator creates synthetic customer-support traffic with four intents. It introduces a shipping/returns regression after 65% of the replay. The integration test asserts that the queue drains, the report is saved, and the conservative alert fires.
 
 The bias estimator is tested against a deliberately skewed sample: the raw rate is 50%, while weighting recovers the known population mix (about 90.9%). This small fixture tests the estimator's behavior; it is not a claim about real model quality.
+
+The bridge demo double-grades 24 frozen synthetic events across four intents. A seeded
+grader-only score shift produces PSI 27.631, but the bridge quarantines it and emits
+`MEASUREMENT_HOLD` rather than a product incident. The compatible control permits a
+seeded application regression to emit `PRODUCT_INCIDENT`. These deterministic fixtures
+prove attribution control flow, not real-grader stability.
 
 ## Configuration and integration
 
@@ -99,6 +108,7 @@ Call this after producing the user-visible response. Never place raw secrets or 
 | Raw vs weighted rate | Is adaptive sampling biasing the headline? | `report.json` |
 | Effective sample size | Are a few large weights dominating? | `report.json` |
 | PSI | Did the score distribution move? | Per evaluated window |
+| Bridge mean/flip shift | Did the measurement system change? | Overall and per intent |
 
 ## Limitations
 
@@ -108,6 +118,7 @@ Call this after producing the user-visible response. Never place raw secrets or 
 - The process-local daily cap is not coordinated across replicas. A production sampler needs an atomic shared budget.
 - SQLite is appropriate for a portfolio-scale single-node MVP, not high-throughput multi-writer serving.
 - Synthetic labels prove mechanics, not external validity. Human adjudication remains necessary before consequential decisions.
+- Frozen overlap coverage may miss new or rare intents. Compatibility thresholds require calibration on real repeated grades, and quarantine delays product monitoring until the measurement change is resolved.
 - There is no authentication, PII scrubbing, retention policy, semantic grader, hosted dashboard, or outbound alert integration yet.
 
 ## Responsible use
@@ -126,6 +137,7 @@ shadowgauge/
   grading.py      transparent offline graders
   store.py        SQLite queue, grades, and incidents
   monitoring.py   PSI and alert gate
+  bridge.py       grader overlap validation, segment checks, incident attribution
   simulation.py   reproducible synthetic traffic
   cli.py          simulate and worker commands
 tests/             unit and end-to-end checks
@@ -135,3 +147,4 @@ docs/              architecture and rigorous backlog
 ## License
 
 MIT
+

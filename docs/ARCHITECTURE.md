@@ -26,8 +26,20 @@ Required event fields are `event_id`, ISO-8601 `ts`, `intent`, `question`, `cont
 - If event IDs repeat, `INSERT OR IGNORE` prevents duplicate grading.
 - If probabilities are omitted or wrong, weighted estimates are invalid. The API rejects probabilities outside `(0, 1]`.
 - If a daily cap is reached, decisions carry `daily_cap` as the reason but are not queued. The host should count rejected decisions for coverage reporting.
-- If a grader changes, current scores are not directly comparable. The P2 bridge in the backlog addresses this explicitly.
+- If a grader changes, current scores are not directly comparable. The bridge requires a frozen overlap before product attribution.
+
+## Grader-version bridge
+
+Before promotion, the old and proposed graders score the same frozen events.
+`analyze_bridge` validates unique IDs, bounded scores, distinct version names and
+minimum coverage per intent. It reports paired mean shifts and pass/fail flips overall
+and by segment. Any coverage or compatibility violation quarantines the transition.
+`classify_product_drift` labels a shifted window `MEASUREMENT_HOLD` while the bridge
+is quarantined, preventing a grader-only change from becoming a product incident.
+This does not authenticate versions, persist approval state or prove coverage beyond
+the supplied overlap.
 
 ## Production hardening path
 
 Add privacy transforms before persistence, use a shared queue and budget counter, version all policies and graders, enforce minimum segment counts, and connect incident records to an authenticated delivery adapter. Validate every threshold on a frozen replay plus human-reviewed labels before enabling paging.
+

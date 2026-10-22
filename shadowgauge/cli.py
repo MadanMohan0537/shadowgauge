@@ -11,6 +11,8 @@ from .sampling import AdaptiveSampler, estimate_failure_rate
 from .simulation import generate_events
 from .store import Store
 from .worker import run_batch
+from .bridge import analyze_bridge, classify_product_drift
+from .simulation import generate_bridge_overlap
 
 
 def simulate(db_path: str, output: str, count: int) -> dict:
@@ -66,13 +68,25 @@ def main(argv: list[str] | None = None) -> int:
     work = sub.add_parser("worker", help="grade one pending batch")
     work.add_argument("--db", default="shadowgauge.db")
     work.add_argument("--limit", type=int, default=100)
+    bridge = sub.add_parser("bridge-demo", help="reproduce a grader-only shift quarantine")
+    bridge.add_argument("--output", default="bridge-report.json")
     args = parser.parse_args(argv)
     if args.command == "simulate":
         print(json.dumps(simulate(args.db, args.output, args.count), indent=2))
-    else:
+    elif args.command == "worker":
         print(json.dumps({"processed": run_batch(Store(args.db), args.limit)}))
+    else:
+        overlap = generate_bridge_overlap(grader_shift=True)
+        analysis = analyze_bridge(overlap)
+        baseline = [row["old_score"] for row in overlap["rows"]]
+        current = [row["new_score"] for row in overlap["rows"]]
+        report = {**analysis, "drift_decision": classify_product_drift(
+            baseline, current, analysis)}
+        Path(args.output).write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+        print(json.dumps(report, indent=2))
     return 0
 
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
